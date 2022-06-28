@@ -1,0 +1,181 @@
+# Copyright (C) 2016-2019 Semtech (International) AG. All rights reserved.
+#
+# This file is subject to the terms and conditions defined in file 'LICENSE',
+# which is part of this source code package.
+
+-include Makefile.local
+-include ../Makefile.local
+
+TOPDIR ?= ../..
+
+include $(TOPDIR)/projects/variants.mk
+include $(TOPDIR)/projects/platform.mk
+
+#TARGET ?= $(error "TARGET not specified (See platform.gmk for possible settings)")
+
+LMICDIR		:= $(TOPDIR)/lmic
+TOOLSDIR	:= $(TOPDIR)/tools
+COMMONDIR	:= $(TOPDIR)/common
+DRIVERDIR	?= $(TOPDIR)/drivers
+SVCSDIR		+= $(TOPDIR)/services
+BUILDDIR_PFX	:= build-
+
+PROJECT		?= $(notdir $(lastword $(CURDIR)))
+
+CFLAGS		+= $(FLAGS)
+LDFLAGS		+= $(FLAGS)
+ASFLAGS		+= $(FLAGS)
+
+DEFS		+= -DVARIANT="\"$(VARIANT)\""
+DEFS		+= -DPROJECT="\"$(PROJECT)\""
+DEFS		+= $(addprefix -DCFG_,$(REGIONS))
+DEFS		+= $(addprefix -DCFG_,$(LMICCFG))
+
+PDEFS		+= $(filter-out $(UNDEFS),$(DEFS))
+CFLAGS		+= $(PDEFS)
+ASDEFS		+= $(PDEFS)
+
+CFLAGS		+= -I$(LMICDIR) -I$(HALDIR)
+CFLAGS		+= -I$(COMMONDIR)
+CFLAGS		+= -I$(DRIVERDIR)
+
+BUILDTIME	:= $(shell date -u +'%FT%TZ')
+
+PATCHFLAGS	+= $(addprefix --target=,$(HWID.$(VARIANT)))
+ifneq ($(RELEASE),)
+PATCHFLAGS	+= $(addprefix --version=,$(RELEASE))
+else
+PATCHFLAGS	+= -v
+endif
+
+SRCS		+= $(notdir $(wildcard $(LMICDIR)/*.c $(HALDIR)/*.c *.c $(HALDIR)/*.S))
+
+VPATH		+= $(LMICDIR) $(HALDIR)
+
+ifneq ($(COMMON),)
+    SRCS	+= $(COMMON)
+    VPATH	+= $(COMMONDIR)
+    DEFS	+= $(addprefix -DCOMMON_,$(basename $(notdir $(COMMON))))
+endif
+
+ifneq ($(DRIVER),)
+    SRCS	+= $(DRIVER)
+    VPATH	+= $(DRIVERDIR)
+    DEFS	+= $(addprefix -DDRIVER_,$(basename $(notdir $(DRIVER))))
+endif
+
+SVCTOOLARGS	+= $(addprefix -p ,$(SVCSDIR)) -p . $(SVCS)
+SVCCHECK	:= $(shell $(SVCTOOL) check $(SVCTOOLARGS))
+ifneq ($(SVCCHECK),)
+    $(error $(SVCCHECK))
+endif
+
+SVCDEFS_H 	 = $(BUILDDIR)/svcdefs.h
+ifneq ($(SVCS),)
+    VPATH	+= $(SVCSDIR)
+    SVCSRCS	:= $(shell $(SVCTOOL) sources $(SVCTOOLARGS))	# only once
+    SRCS	+= $(SVCSRCS)
+    SVC_DEPS	+= $(SVCDEFS_H)
+    CFLAGS	+= -I$(BUILDDIR) $(addprefix -I,$(SVCSDIR))
+    SVCSDEFS	:= $(shell $(SVCTOOL) defines $(SVCTOOLARGS))	# only once
+    DEFS	+= $(addprefix -D,$(SVCSDEFS))
+endif
+
+OBJS		 = $(filter-out $(addprefix $(BUILDDIR)/,$(OBJS_BLACKLIST)),$(patsubst %,$(BUILDDIR)/%.o,$(basename $(SRCS))))
+
+ALL		?= error_all
+LOAD		?= error_load
+
+OOFLAGS		+= $(addprefix -f ,$(OOCFGS))
+
+BUILDDIRS	 = $(sort $(dir $(OBJS)))
+
+MAKE_DEPS	:= $(MAKEFILE_LIST)	# before we include all the *.d files...
+
+default: variant
+
+variant: $(VTARGET)
+
+variants: $(VTARGETS)
+
+variant-%:
+	$(MAKE) -j 6 variant VARIANT=$*
+
+all: $(ALL)
+
+error_all:
+	$(error No output targets collected for this build)
+
+error_load:
+	$(error No load target collected for this build)
+
+$(OBJS): $(MAKE_DEPS)
+
+$(OBJS): | $(BUILDDIRS) $(SVC_DEPS)
+
+$(BUILDDIR)/%.o: %.c
+	$(CC) -c $(CFLAGS) $< -o $@
+
+$(BUILDDIR)/%.o: %.s
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILDDIR)/%.o: %.S
+	$(CC) -c $(ASFLAGS) $(ASDEFS) $< -o $@
+
+$(BUILDDIR)/%.out: $(OBJS)
+	$(LD) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILDDIR)/%.a: $(OBJS)
+	$(AR) rcs $@ $^ -o $@
+
+$(BUILDDIR)/%.unpatched.hex: $(BUILDDIR)/%.out
+	$(HEX) $< $@
+
+$(BUILDDIR)/%.zfw: $(BUILDDIR)/%.unpatched.hex
+	$(ZFWTOOL) create --patch \
+	    --meta project "$(PROJECT)" \
+	    --meta variant "$(VARIANT)" \
+	    --meta build_time "$(BUILDTIME)" \
+	    $< $@
+	$(ZFWTOOL) info $@
+
+$(BUILDDIR)/%.hex: $(BUILDDIR)/%.zfw
+	$(ZFWTOOL) export $< $@
+
+$(BUILDDIR)/%.bin: $(BUILDDIR)/%.zfw
+	$(ZFWTOOL) export $< $@
+
+$(SVCDEFS_H): $(MAKE_DEPS) | $(BUILDDIRS)
+	$(SVCTOOL) svcdefs -o $@ -d $(SVCTOOLARGS)
+
+print-%  : ; @echo $* = $($*)
+
+clean:
+	rm -rf build/ $(BUILDDIR_PFX)*
+
+load: $(LOAD)
+
+loadhex: $(BUILDDIR)/$(PROJECT).hex
+	$(OPENOCD) $(OOFLAGS) -c "flash_ihex $<"
+
+loadbl:
+	$(OPENOCD) $(OOFLAGS) -c "flash_ihex $(BL_BUILD)/bootloader.hex"
+
+combinebl:	
+	@cat $(BL_BUILD)/bootloader_padded.bin $(BUILDDIR)/$(PROJECT).bin > $(BUILDDIR)/$(PROJECT)_combined.bin
+
+debug: $(BUILDDIR)/$(PROJECT).out
+	$(GDB) $< -ex 'target remote | $(OPENOCD) $(OOFLAGS) -c "gdb_port pipe;"' -ex "monitor reset halt"
+
+$(BUILDDIRS):
+	mkdir -p $@
+
+.PHONY: default all clean load loadhex loadbin loadfw loadup loadbl loadosbl debug variant variants combinebl
+
+.SECONDARY:
+
+.DELETE_ON_ERROR:
+
+-include $(OBJS:.o=.d) $(SVCDEFS_H:.h=.d)
+
+# vim: filetype=make

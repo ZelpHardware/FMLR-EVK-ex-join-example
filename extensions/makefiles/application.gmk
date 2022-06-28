@@ -1,0 +1,102 @@
+# Common makefile for applications
+
+# set directory of trackmac stack
+TOPDIR := ../basicmac
+
+# directory variables
+EXTENSIONSDIR   ?= ../extensions
+DRIVERDIR       ?= $(EXTENSIONSDIR)/drivers
+UTILSDIR        ?= $(EXTENSIONSDIR)/utils
+
+SVCSDIR         += $(EXTENSIONSDIR)/services
+
+PROJECT         ?= $(notdir $(lastword $(subst /, ,$(subst application, , $(CURDIR)))))
+
+# common build dir, which is used for variant independend output
+CBUILDDIR		:= build
+
+# add application directory to include path
+CFLAGS += -I.
+CFLAGS += -I$(EXTENSIONSDIR)/modules
+
+# add git commit to compile defines
+GIT_COMMIT := $(shell git describe --always --dirty --match 'NOT A TAG')
+DEFS += -DGIT_COMMIT=\"$(GIT_COMMIT)\"
+
+ifneq (,$(EE_CSV))
+EE_PARAMS += --csv $(EE_CSV) --line $(EE_CSV_LINE)
+endif
+
+EE_HEX := $(CBUILDDIR)/eeprom.hex
+
+FAM_MAKEFILES += $(wildcard $(EXTENSIONSDIR)/makefiles/fam-*.mk)
+BL_BUILD ?= $(BL)/build/boards/$(BL_BRD)
+
+include $(TOPDIR)/projects/projects.gmk
+
+jloadee: eeprom.yaml $(EE_CSV)
+	@mkdir -p $(CBUILDDIR)
+	$(UTILSDIR)/eeprom.py eeprom.yaml $(EE_PARAMS) -o $(EE_HEX)
+	@echo 'Device $(JLINKDEV)\nIf SWD\nspeed 4000\nr\nh\nloadfile $(EE_HEX)\nr\ngo\nexit' >| $(CBUILDDIR)/flash.jlink
+	@$(JLINK) -ExitOnError -JLinkScriptfile $(CBUILDDIR)/flash.jlink
+
+loadee: eeprom.yaml $(EE_CSV)
+	@mkdir -p $(CBUILDDIR)
+	$(UTILSDIR)/eeprom.py eeprom.yaml $(EE_PARAMS) -o $(EE_HEX)
+	$(OPENOCD) $(OOFLAGS) -c "flash_ihex $(EE_HEX)"
+
+jloadbl: $(BL_BUILD)/bootloader.hex
+# First create jlink script files from the config, then flash it
+	@mkdir -p $(CBUILDDIR)
+	@echo 'Device $(JLINKDEV)\nIf SWD\nspeed 4000\nr\nh\nerase\nloadfile $<\nr\ngo\nexit' >| $(CBUILDDIR)/flash.jlink
+	@$(JLINK) -ExitOnError -JLinkScriptfile $(CBUILDDIR)/flash.jlink
+
+jload: $(BUILDDIR)/$(PROJECT).hex
+# First create an .elf file and some jlink script files from the config, then flash it
+	@mkdir -p $(CBUILDDIR)
+	@cp -f $(BUILDDIR)/$(PROJECT).out $(BUILDDIR)/$(PROJECT).elf
+	@echo 'Device $(JLINKDEV)\nIf SWD\nspeed 4000\nr\nh\nloadfile $<\nr\ngo\nexit' >| $(CBUILDDIR)/flash.jlink
+	@$(JLINK) -ExitOnError -JLinkScriptfile $(CBUILDDIR)/flash.jlink
+
+jdebug: $(BUILDDIR)/$(PROJECT).out
+#	$(MAKE) -f $(FIRST_FILE) jload
+	$(JLINKGDB) -If SWD -Device $(JLINKDEV)
+#	$(CROSS_COMPILE)gdb $< -ex 'target remote localhost:2331'
+#	killall $(JLINKGDB)
+
+ifeq (simul,$(VARIANT))
+test: build-$(VARIANT)/$(PROJECT).hex
+	PYTHONPATH=$${PYTHONPATH}:$(TOPDIR)/tools/pylora:$(TOPDIR)/unicorn/simul \
+		   $(TOPDIR)/unicorn/simul/lwtest.py \
+		   -r EU868 \
+		   -v -d -t \
+		   $(TESTOPTS) \
+		   $(BL)/build/boards/$(BL_BRD)/bootloader.hex \
+		   $<
+
+apptest: build-$(VARIANT)/$(PROJECT).hex
+	PYTHONPATH=$${PYTHONPATH}:$(TOPDIR)/tools/pylora:$(TOPDIR)/unicorn/simul \
+		   ./test.py \
+		   -r EU868 \
+		   -v -d -t \
+		   $(TESTOPTS) \
+		   $(BL)/build/boards/$(BL_BRD)/bootloader.hex \
+		   $<
+
+test.up: build-$(VARIANT)/$(PROJECT).zfw
+	$(ZFWTOOL) mkupdate $< $@
+
+fuotatest: build-$(VARIANT)/$(PROJECT).hex
+	PYTHONPATH=$${PYTHONPATH}:$(TOPDIR)/tools/pylora:$(TOPDIR)/unicorn/simul:$(TOPDIR)/basicloader/tools/fwtool \
+		   ZFWFILE=$(<:.hex=.zfw) \
+		   $(TOPDIR)/services/fuota/test.py \
+		   -r EU868 \
+		   -v -d -t \
+		   $(TESTOPTS) \
+		   $(BL)/build/boards/$(BL_BRD)/bootloader.hex \
+		   $<
+endif
+
+.PHONY: test apptest fuotatest jloadee jloadbl jload jdebug for
+
+# vim: filetype=make

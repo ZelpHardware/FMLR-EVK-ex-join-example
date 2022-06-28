@@ -1,0 +1,11 @@
+hook.appstart: app_main
+hook.lwm_downlink: app_dl
+
+require:
+    - appstart
+    - lwmux
+    - lwtest
+    - frag
+    - fwman
+
+# vim: syntax=yaml

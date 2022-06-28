@@ -1,0 +1,14 @@
+hook.appstart: app_main
+hook.lwm_downlink: app_dl
+hook.lwm_event:     app_event
+hook.dl_msg:        dlmsg_process
+hook.uexti_irq:     button_irq
+
+require:
+    - appstart
+    - lwmux
+    - lwtest
+    - uexti
+    - pwrman
+
+# vim: syntax=yaml
